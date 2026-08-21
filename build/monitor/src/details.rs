@@ -54,3 +54,35 @@ pub fn spawn_details_fetcher(updates: Sender<Update>) -> Sender<Option<String>> 
     });
     tx
 }
+
+/// Background worker for the Processes tab: fetches `qps` (or `qps_gpu` for
+/// GPU jobs) for the requested job and emits `Update::Procs`. Same coalescing
+/// shape as the details fetcher — qps can take seconds (it runs `ps` on the
+/// job's compute nodes), so only the latest request is served.
+pub fn spawn_procs_fetcher(updates: Sender<Update>) -> Sender<(String, bool)> {
+    let (tx, rx) = channel::<(String, bool)>();
+    std::thread::spawn(move || {
+        loop {
+            let mut latest = match rx.recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            while let Ok(next) = rx.try_recv() {
+                latest = next;
+            }
+            let (jobid, gpu) = latest;
+            let text = match pbs::fetch_procs(&jobid, gpu) {
+                Ok(out) if out.trim().is_empty() => {
+                    format!("qps returned nothing for {jobid} (the job may be between phases).")
+                }
+                Ok(out) => out,
+                Err(e) => format!(
+                    "Unable to list processes for {jobid}.\n\n{e}\n\nqps only works on \
+                     your own running jobs; try Ctrl-R once the job is running."
+                ),
+            };
+            let _ = updates.send(Update::Procs { job: jobid, text });
+        }
+    });
+    tx
+}

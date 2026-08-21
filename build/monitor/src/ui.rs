@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 const LEGEND: &str =
-    " ←/→ tab · ↑/↓ scroll · ,/. job · a/q/r sections · e/c compact · u user · ^R refresh";
+    " ←/→ tab · ↑/↓ scroll · ,/. job · a/q/r/f sections · e/c compact · u user · ^R refresh";
 const ERROR_TTL_SECS: u64 = 15;
 // Section accent colours; the `┃` column dividers match their section title.
 const RUN_COLOR: Color = Color::Blue;
@@ -330,14 +330,22 @@ fn layout_columns(
     lines
 }
 
-/// The Job Usage tab content: the ANSI panel rendered by `usage::render`
-/// (summary + one row per running job). Used both to render the tab and to
-/// size the top pane.
+/// The Job Usage tab content: the slow-cadence SU/storage header and any
+/// scratch-expiry warning, then the ANSI panel rendered by
+/// `usage::render_full` (summary, running table, queued diagnosis, nodes,
+/// queue pressure). Used both to render the tab and to size the top pane.
 fn usage_text(app: &App) -> Text<'static> {
-    app.usage
-        .as_str()
-        .into_text()
-        .unwrap_or_else(|_| Text::raw(app.usage.clone()))
+    let mut s = String::new();
+    if !app.account.is_empty() {
+        s.push_str(&app.account);
+        s.push('\n');
+    }
+    if let Some(e) = &app.expiry {
+        s.push_str(e);
+        s.push('\n');
+    }
+    s.push_str(&app.usage);
+    s.as_str().into_text().unwrap_or_else(|_| Text::raw(s.clone()))
 }
 
 fn freshness_line(app: &App) -> Line<'static> {
@@ -383,6 +391,8 @@ fn tab_title(app: &App) -> Line<'static> {
         ),
         Span::raw(" "),
         tab(" Details ", Color::Gray, app.top_tab == TopTab::Details),
+        Span::raw(" "),
+        tab(" Processes ", Color::Cyan, app.top_tab == TopTab::Processes),
     ])
 }
 
@@ -399,19 +409,24 @@ fn render_top(f: &mut Frame, area: Rect, app: &mut App, u_text: Text<'static>) {
         TopTab::Usage => u_text.lines.len(),
         TopTab::LogPreview => app.log.len(),
         TopTab::Details => app.details.lines().count(),
+        TopTab::Processes => app.procs.lines().count(),
     };
     let max_off = total.saturating_sub(inner_h);
 
-    // Resolve the scroll offset (disjoint mutable borrow of the active tab's fields).
+    // Resolve the scroll offset (disjoint mutable borrow of the active tab's
+    // fields). "Follow" pins the streaming tabs (log/details/processes) to
+    // their bottom; the Usage tab is a dashboard whose headline content (quota
+    // chart, summary, table header) is at the top, so it pins there instead.
+    let home = if tab == TopTab::Usage { 0 } else { max_off };
     let (follow, scroll) = app.active();
     let off = if *follow {
-        *scroll = max_off; // pin to the bottom
-        max_off
+        *scroll = home; // pin to the tab's home edge
+        home
     } else {
         let clamped = (*scroll).min(max_off);
         *scroll = clamped; // write back the clamp (prevents unbounded offsets)
-        if clamped >= max_off {
-            *follow = true; // scrolled back to the bottom -> re-engage follow
+        if clamped == home {
+            *follow = true; // scrolled back to the home edge -> re-engage follow
         }
         clamped
     };
@@ -421,6 +436,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &mut App, u_text: Text<'static>) {
     let (text, scroll_off): (Text, u16) = match tab {
         TopTab::Usage => (u_text, off.min(u16::MAX as usize) as u16),
         TopTab::Details => (Text::raw(app.details.clone()), off.min(u16::MAX as usize) as u16),
+        TopTab::Processes => (Text::raw(app.procs.clone()), off.min(u16::MAX as usize) as u16),
         TopTab::LogPreview => {
             // Lines are sanitized at ingestion (logs::sanitize_log_line), so plain here.
             let end = (off + inner_h).min(app.log.len());
@@ -446,6 +462,7 @@ enum Slot {
     Running,
     Queued,
     Array,
+    Recent,
     Status,
 }
 
@@ -453,11 +470,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let width = area.width;
 
-    let array_text: Option<Text> = app
-        .array
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(|raw| raw.into_text().unwrap_or_else(|_| Text::raw(raw.to_string())));
+    let ansi_opt = |s: Option<&str>| -> Option<Text> {
+        s.filter(|s| !s.trim().is_empty())
+            .map(|raw| raw.into_text().unwrap_or_else(|_| Text::raw(raw.to_string())))
+    };
+    let array_text: Option<Text> = ansi_opt(app.array.as_deref());
+    let recent_text: Option<Text> = ansi_opt(app.recent.as_deref());
 
     // Expanded rows decide visibility and whether we must auto-compact.
     let run_exp = job_rows(app, true, false);
@@ -465,18 +483,38 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let show_running = !run_exp.is_empty() && app.show_running;
     let show_queued = !que_exp.is_empty() && app.show_queued;
     let show_array = array_text.is_some() && app.show_array;
+    let mut show_recent = recent_text.is_some() && app.show_recent;
 
-    // The top pane is kept at least tall enough to show the full Job Usage content;
-    // the job sections share whatever is left (below the status line and array box).
+    // The top pane is kept tall enough to show the full Job Usage content —
+    // but only up to 2/3 of the terminal whenever any bottom section has data.
+    // With many jobs the panel's content can exceed the whole terminal, and an
+    // uncapped Min constraint would swallow it, squeezing the job sections to
+    // zero height (where they are dropped and a/q/r can't bring them back).
+    // Past the cap the tab simply scrolls (top-anchored; End jumps down).
     // Built once: used here to size the pane and handed to render_top to draw.
     // +1 for the pane's top border/title row (its content area is height - 1).
     let u_text = usage_text(app);
     let u_height = u_text.lines.len() + 1;
-    let top_min = u_height.max(3).min((area.height as usize).saturating_sub(1).max(1));
-    let gaps = show_running as usize + show_queued as usize + show_array as usize;
+    let h = area.height as usize;
+    let have_sections = show_running || show_queued || show_array || show_recent;
+    let cap = if have_sections { (h * 2 / 3).max(3) } else { h.saturating_sub(1).max(1) };
+    let top_min = u_height.max(3).min(cap).min(h.saturating_sub(1).max(1));
+    let gaps =
+        show_running as usize + show_queued as usize + show_array as usize + show_recent as usize;
     let array_h = array_text.as_ref().map(|t| 1 + t.lines.len()).unwrap_or(0);
+    let recent_h = if show_recent {
+        recent_text.as_ref().map(|t| 1 + t.lines.len()).unwrap_or(0)
+    } else {
+        0
+    };
     // Reserve 2 rows at the bottom: a blank separator + the status bar.
-    let avail = (area.height as usize).saturating_sub(top_min + 2 + gaps + array_h);
+    let mut avail = h.saturating_sub(top_min + 2 + gaps + array_h + recent_h);
+    // Still too tight for the running/queued lists? Sacrifice RECENT first —
+    // it's history, they're live. (+1 reclaims its section gap too.)
+    if show_recent && avail < 4 && (show_running || show_queued) {
+        show_recent = false;
+        avail += recent_h + 1;
+    }
 
     // Auto-compact when the expanded lists can't fit; a manual e/c toggle overrides.
     let need_r_exp = if show_running { section_need(&run_exp, width) } else { 0 };
@@ -514,6 +552,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         slots.push((Slot::Gap, Constraint::Length(1)));
         slots.push((Slot::Array, Constraint::Length(1 + n)));
     }
+    if show_recent {
+        let n = recent_text.as_ref().unwrap().lines.len() as u16;
+        slots.push((Slot::Gap, Constraint::Length(1)));
+        slots.push((Slot::Recent, Constraint::Length(1 + n)));
+    }
     // Blank line separating the last section (or the top pane) from the toolbar.
     slots.push((Slot::Gap, Constraint::Length(1)));
     slots.push((Slot::Status, Constraint::Length(1)));
@@ -530,6 +573,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let mut running = Some(running);
     let mut queued = Some(queued);
     let mut array_text = array_text;
+    let mut recent_text = recent_text;
 
     for ((slot, _), rect) in slots.iter().zip(rects.iter()) {
         match slot {
@@ -555,6 +599,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 "ARRAY JOB PROGRESS",
                 Color::Green,
                 array_text.take().unwrap_or_default(),
+            ),
+            Slot::Recent => render_section(
+                f,
+                *rect,
+                "RECENT JOBS",
+                Color::Cyan,
+                recent_text.take().unwrap_or_default(),
             ),
             Slot::Status => {
                 if let Some(buf) = &app.input {
@@ -742,6 +793,40 @@ mod tests {
     }
 
     #[test]
+    fn top_pane_capped_so_sections_survive() {
+        let mut app = App::new();
+        // A usage panel far taller than the terminal (many running jobs).
+        let big: String = (0..50).map(|i| format!("usage-line-{i}\n")).collect();
+        app.apply(Update::Usage(big));
+        app.apply(Update::Jobs(vec![
+            job("1.gadi-pbs", JobState::Running, None),
+            job("2.gadi-pbs", JobState::Queued, None),
+        ]));
+        app.apply(Update::Recent(Some("174190352  montest  ok".into())));
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let dump: String =
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        // The job sections survive: the pane is capped at 2/3 of the height…
+        assert!(dump.contains("RUNNING JOBS"));
+        assert!(dump.contains("QUEUED & HELD JOBS"));
+        // …RECENT is sacrificed first when space is tight…
+        assert!(!dump.contains("RECENT JOBS"));
+        // …and the pane is top-anchored: the first usage line is visible, the
+        // last is scrolled out of view rather than the other way around.
+        assert!(dump.contains("usage-line-0"));
+        assert!(!dump.contains("usage-line-49"));
+
+        // With no bottom sections at all, the pane may take the whole screen.
+        app.apply(Update::Jobs(Vec::new()));
+        app.apply(Update::Recent(None));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let dump2: String =
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(dump2.contains("usage-line-25")); // beyond the 2/3 cap line
+    }
+
+    #[test]
     fn draw_auto_compacts_when_overflowing() {
         let mut app = App::new();
         let jobs: Vec<Job> = (1..=40)
@@ -769,6 +854,9 @@ mod tests {
         app.user = "bh5941".into();
         app.project = "xr78".into();
         app.apply(Update::Usage("1 running (12 cores)".into()));
+        app.apply(Update::Account("SU (2026.q3): 299.0K avail of 299.0K".into()));
+        app.apply(Update::Expiry(Some("⚠ 2 scratch paths scheduled for expiry".into())));
+        app.apply(Update::Recent(Some("174190352  montest  copyq  00:01  sig 15  Jul 20 13:29".into())));
         app.apply(Update::Jobs(vec![
             Job {
                 id: "174170283.gadi-pbs".into(),
@@ -797,8 +885,14 @@ mod tests {
         let dump: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("Job Usage"));
         assert!(dump.contains("Log Preview"));
+        assert!(dump.contains("Processes"));
         assert!(dump.contains("RUNNING JOBS"));
         assert!(dump.contains("QUEUED & HELD JOBS"));
+        // The bottom RECENT section and the slow-cadence usage-tab header lines.
+        assert!(dump.contains("RECENT JOBS"));
+        assert!(dump.contains("sig 15"));
+        assert!(dump.contains("SU (2026.q3)"));
+        assert!(dump.contains("scheduled for expiry"));
         // Job rows show the number with the `.gadi-pbs` server suffix stripped.
         assert!(dump.contains("174170283 ")); // running row, stripped id
         assert!(dump.contains("174187629 ")); // queued row, stripped id
@@ -815,5 +909,23 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let dump2: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(dump2.contains("log line one"));
+
+        // The f toggle hides the RECENT section.
+        app.toggle_recent();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let dump3: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(!dump3.contains("RECENT JOBS"));
+
+        // The Processes tab shows the qps pane.
+        app.procs_job = Some("174170283.gadi-pbs".into());
+        app.apply(Update::Procs {
+            job: "174170283.gadi-pbs".into(),
+            text: "  PID COMMAND\n 1234 julia".into(),
+        });
+        app.next_tab(); // LogPreview -> Details
+        app.next_tab(); // Details -> Processes
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let dump4: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(dump4.contains("1234 julia"));
     }
 }

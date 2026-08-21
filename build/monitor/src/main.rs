@@ -1,4 +1,4 @@
-use monitor::app::{App, Update};
+use monitor::app::{App, TopTab, Update};
 use monitor::logs::{self, LogTarget};
 use monitor::poller::{self, PollCmd, PollIntervals};
 use monitor::{details, pbs, ui};
@@ -31,6 +31,9 @@ struct Cli {
     /// Spooled-output (qcat) poll interval, seconds
     #[arg(long, default_value_t = 15)]
     qcat_interval: u64,
+    /// SU-accounting / scratch-expiry poll interval, seconds
+    #[arg(long, default_value_t = 600)]
+    account_interval: u64,
 }
 
 /// Restores the terminal on drop, even on panic.
@@ -74,18 +77,23 @@ fn main() -> anyhow::Result<()> {
         PathBuf::from(home).join(".jobs")
     };
 
+    let project = std::env::var("PROJECT").unwrap_or_default();
+
     // Channels: poller + log watcher both send Updates to the main loop.
     let (update_tx, update_rx) = channel::<Update>();
     let poll_tx = poller::spawn_poller(
         user.clone(),
+        project.clone(),
         PollIntervals {
             jobs: Duration::from_secs(cli.jobs_interval),
             usage: Duration::from_secs(cli.usage_interval),
+            account: Duration::from_secs(cli.account_interval),
         },
         update_tx.clone(),
     );
     let log_tx = logs::spawn_log_watcher(update_tx.clone(), Duration::from_secs(cli.qcat_interval));
     let detail_tx = details::spawn_details_fetcher(update_tx.clone());
+    let procs_tx = details::spawn_procs_fetcher(update_tx.clone());
 
     // Fuzzy candidates for the `u` switch: project-group members, fetched once
     // in the background (getent can stall on a slow LDAP; never block the UI).
@@ -114,7 +122,7 @@ fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let mut app = App::new();
     app.user = user;
-    app.project = std::env::var("PROJECT").unwrap_or_default();
+    app.project = project;
 
     // Log-target tracking: re-resolve on selection change immediately, and every
     // couple of seconds otherwise (details arriving, the ~/.jobs log or the
@@ -140,6 +148,28 @@ fn main() -> anyhow::Result<()> {
             if target != current_target {
                 current_target = target.clone();
                 let _ = log_tx.send(target);
+            }
+        }
+
+        // Processes tab: point the qps worker at the selected job whenever the
+        // tab is visible and the pane isn't already on (or fetching) it.
+        if app.top_tab == TopTab::Processes {
+            match app.selected_job_id.clone() {
+                Some(id) => {
+                    if app.procs_job.as_deref() != Some(id.as_str()) {
+                        let gpu = app
+                            .selected_job()
+                            .map(|j| j.queue.contains("gpu") || j.queue.contains("dgx"))
+                            .unwrap_or(false);
+                        app.procs_job = Some(id.clone());
+                        app.procs = format!("Fetching processes for {id}…");
+                        let _ = procs_tx.send((id, gpu));
+                    }
+                }
+                None => {
+                    app.procs_job = None;
+                    app.procs = "No running job selected.".into();
+                }
             }
         }
 
@@ -189,6 +219,7 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('a') => app.toggle_array(),
                         KeyCode::Char('q') => app.toggle_queued(),
                         KeyCode::Char('r') if !ctrl => app.toggle_running(),
+                        KeyCode::Char('f') => app.toggle_recent(),
                         // Toggle array-job compaction (e/c are redundant mnemonics)
                         KeyCode::Char('e') | KeyCode::Char('c') => app.toggle_compact(),
                         // Open the username switch box
@@ -197,6 +228,9 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('r') if ctrl => {
                             let _ = poll_tx.send(PollCmd::Refresh);
                             let _ = detail_tx.send(app.selected_job_id.clone());
+                            // Clearing procs_job makes the next loop iteration
+                            // re-request the listing if the tab is showing.
+                            app.procs_job = None;
                         }
                         _ => {}
                     }

@@ -1,0 +1,112 @@
+#!/bin/bash
+# qeff — CPU utilization / efficiency for a running Gadi PBS job.
+#   qeff [JOBID]                  one-shot summary (qps snapshot + PBS lifetime accounting)
+#   qeff --watch [SECS] [JOBID]   live "recent %CPU" from PBS cput deltas (cheap, no SSH)
+#   qeff --now [JOBID]            instantaneous per-node core saturation (SSH /proc/stat)
+# All %CPU is normalized against Resource_List.ncpus (physical cores you're billed), not nproc.
+set -uo pipefail
+
+job_ftext(){ qstat -f "$1" 2>/dev/null | sed ':a;N;$!ba;s/\n\t//g'; }
+job_attr(){ awk -F' = ' -v a="$2" '$0 ~ "^ *"a" ="{print $2; exit}' <<<"$1"; }
+tosec(){ awk -F: '{print ($1*3600)+($2*60)+$3}' <<<"${1:-0:0:0}"; }
+
+mode=summary; watch_iv=30; jid=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --watch) mode=watch; [[ "${2:-}" =~ ^[0-9]+$ ]] && { watch_iv="$2"; shift; }; shift;;
+        --now)   mode=now; shift;;
+        -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+        -*)      echo "qeff: unknown option $1" >&2; exit 1;;
+        *)       jid="$1"; shift;;
+    esac
+done
+
+# Resolve job id (auto-pick the single running job if none given).
+if [ -z "$jid" ]; then
+    mapfile -t r < <(qstat -u "$USER" 2>/dev/null | awk '/^[0-9]+\./{print $1}')
+    run=(); for id in "${r[@]}"; do [ "$(job_attr "$(job_ftext "$id")" job_state)" = R ] && run+=("$id"); done
+    [ ${#run[@]} -eq 1 ] || { echo "qeff: specify a job id (${#run[@]} running)" >&2; exit 1; }
+    jid="${run[0]}"
+fi
+t="$(job_ftext "$jid")"
+[ -n "$t" ] || { echo "qeff: no such job $jid" >&2; exit 1; }
+[ "$(job_attr "$t" job_state)" = R ] || { echo "qeff: job $jid not running" >&2; exit 1; }
+ncpus=$(job_attr "$t" Resource_List.ncpus)
+
+# ---- live recent %CPU from cput deltas (no SSH) --------------------------------
+# resources_used.cput/walltime advance together each PBS MoM poll (~10-120s). We diff
+# them between polls, so recent%CPU = Δcput/(ncpus·Δwalltime) — an exact utilization
+# for the window PBS actually measured, and it excludes the startup ramp.
+watch_mode(){
+    echo "qeff --watch $jid  (recent %CPU from PBS cput deltas; ncpus=$ncpus; Ctrl-C to stop)"
+    echo "rows land as new PBS polls arrive (interval ~${watch_iv}s; cput updates every ~10-120s)"
+    local pc="" pw=""
+    while :; do
+        local tt st c w cpp life
+        tt="$(job_ftext "$jid")"
+        st="$(job_attr "$tt" job_state)"
+        [ "$st" = R ] || { echo "job $jid ended (state ${st:-?})"; break; }
+        c=$(tosec "$(job_attr "$tt" resources_used.cput)")
+        w=$(tosec "$(job_attr "$tt" resources_used.walltime)")
+        cpp=$(job_attr "$tt" resources_used.cpupercent)
+        life=$(awk -v c=$c -v w=$w -v n=$ncpus 'BEGIN{printf "%.1f", (w>0)?100*c/(n*w):0}')
+        if [ -n "$pw" ] && [ "$w" != "$pw" ]; then
+            recent=$(awk -v c=$c -v pc=$pc -v w=$w -v pw=$pw -v n=$ncpus \
+                     'BEGIN{printf "%.1f", 100*(c-pc)/(n*(w-pw))}')
+            printf '  %(%H:%M:%S)T  recent=%6s%%  lifetime=%5s%%  pbs_cpupct=%s%%\n' \
+                   -1 "$recent" "$life" "$cpp"
+        fi
+        pc=$c; pw=$w
+        sleep "$watch_iv"
+    done
+}
+
+# ---- instantaneous per-node saturation via SSH /proc/stat ----------------------
+now_mode(){
+    local nodes; nodes=$(job_attr "$t" exec_host | tr '+' '\n' | sed 's#/.*##')
+    echo "qeff --now $jid  (instantaneous, 1s /proc/stat delta per node)"
+    local tot=0 lcnt=0
+    for n in $nodes; do
+        local out
+        out=$(ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$n" '
+            read _ a b c d e f g h _ < /proc/stat; i1=$((d+e)); t1=$((a+b+c+d+e+f+g+h)); nc=$(nproc --all)
+            sleep 1
+            read _ a b c d e f g h _ < /proc/stat; i2=$((d+e)); t2=$((a+b+c+d+e+f+g+h))
+            awk -v i1=$i1 -v i2=$i2 -v t1=$t1 -v t2=$t2 -v nc=$nc "BEGIN{printf \"%.1f %d\", 100*(1-(i2-i1)/(t2-t1)), nc}"') \
+            || { printf "  %-22s ssh failed\n" "$n"; continue; }
+        read -r busy nc <<<"$out"
+        printf "  %-22s %5.1f%% of %s logical busy  (= %.1f cores)\n" \
+               "$n" "$busy" "$nc" "$(awk -v b=$busy -v c=$nc 'BEGIN{print b*c/100}')"
+        tot=$(awk -v x=$tot -v b=$busy -v c=$nc 'BEGIN{print x+b*c/100}'); lcnt=$((lcnt+nc))
+    done
+    awk -v t=$tot -v phys=$ncpus 'BEGIN{printf "  ----\n  %.1f cores busy vs %s physical billed = %.0f%% of what you pay for\n", t, phys, 100*t/phys}'
+    echo "  (SMT on: logical=2x physical, so full physical use reads ~50% of logical)"
+    echo "  NOTE: this is a 1s PEAK — bursty jobs spike here but average lower;"
+    echo "        trust 'qeff --watch' / lifetime %EFF for sustained utilization."
+}
+
+# ---- one-shot summary ----------------------------------------------------------
+summary_mode(){
+    echo "Job $jid  (ncpus=$ncpus, walltime=$(job_attr "$t" resources_used.walltime))"
+    echo "--- per-node worker CPU (qps = ps %CPU: LIFETIME avg per process, not 'now') ---"
+    qps "$jid" 2>/dev/null | awk '
+      /^Node /{ if(node!=""){printf "  %-22s %2d workers  mean %5.1f%%CPU  (%.1f cores)\n",node,wn,(wn?ws/wn:0),ws/100}
+                node=$2; sub(/[()]/,"",node); wn=0; ws=0 }
+      $1 ~ /^[0-9]+$/ && /--worker/ { ws+=$7; wn++; gtot+=$7; gwn++ }
+      END{ if(node!="")printf "  %-22s %2d workers  mean %5.1f%%CPU  (%.1f cores)\n",node,wn,(wn?ws/wn:0),ws/100
+           printf "  ----\n  TOTAL: %d workers, %.1f core-equiv of %s = %.0f%% (lifetime-avg)\n", gwn, gtot/100, "'"$ncpus"'", gtot/'"$ncpus"'; }'
+    echo "--- lifetime (PBS accounting) ---"
+    local cs ws pbscpu
+    cs=$(tosec "$(job_attr "$t" resources_used.cput)")
+    ws=$(tosec "$(job_attr "$t" resources_used.walltime)")
+    pbscpu=$(job_attr "$t" resources_used.cpupercent)
+    awk -v c=$cs -v w=$ws -v n=$ncpus 'BEGIN{printf "  %%EFF = cput/(ncpus*walltime) = %.1f%%  (whole run, incl. startup ramp)\n",100*c/(n*w)}'
+    printf "  PBS cpupercent (moving avg) = %s%% = %.1f cores\n" "$pbscpu" "$(awk -v x=$pbscpu 'BEGIN{print x/100}')"
+    echo "  tip: 'qeff --watch' for live recent %CPU, 'qeff --now' for per-node saturation"
+}
+
+case "$mode" in
+    watch) watch_mode;;
+    now)   now_mode;;
+    *)     summary_mode;;
+esac

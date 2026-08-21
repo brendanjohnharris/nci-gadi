@@ -1,0 +1,84 @@
+#!/bin/bash
+# sshjob — open a shell (or run a command) on a Gadi compute node where you have a running PBS job.
+#
+# On Gadi you can ssh straight to a node while your job holds it (job-gated host auth), so no reverse
+# tunnel is needed — we just ask PBS where the job is running and connect. Run this from a login node.
+#
+#   sshjob                    # auto-pick your running job (menu if several), shell on its first node
+#   sshjob 174315403          # interactive shell on that job's first node
+#   sshjob 174315403 htop     # run a command instead of an interactive shell
+#   sshjob -n 2 174315403     # target the 2nd node of a multi-node job (1-indexed)
+#   sshjob -n 3               # auto-pick job, connect to its 3rd node
+#
+set -uo pipefail
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+node_idx=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n)   node_idx="${2:?-n needs an index}"; shift 2;;
+        -n*)  node_idx="${1#-n}"; shift;;
+        -h|--help) usage 0;;
+        --)   shift; break;;
+        -*)   echo "sshjob: unknown option $1" >&2; usage 1;;
+        *)    break;;
+    esac
+done
+
+command -v qstat >/dev/null 2>&1 || { echo "sshjob: qstat not found — run this on a Gadi login node" >&2; exit 1; }
+
+# Full `qstat -f` text for a job, with tab-continued wrapped values un-wrapped onto one line.
+job_ftext() { qstat -f "$1" 2>/dev/null | sed ':a;N;$!ba;s/\n\t//g'; }
+# Pull a single attribute value out of that text.
+job_attr()  { awk -F' = ' -v a="$2" '$0 ~ "^ *"a" ="{print $2; exit}' <<<"$1"; }
+
+if [ $# -eq 0 ]; then
+    # No job id: discover the user's RUNNING jobs and pick one.
+    ids=(); running=(); labels=()
+    while read -r id; do ids+=("$id"); done \
+        < <(qstat -u "$USER" 2>/dev/null | awk '/^[0-9]+\./{print $1}')
+    for id in "${ids[@]}"; do
+        t="$(job_ftext "$id")"
+        [ "$(job_attr "$t" job_state)" = "R" ] || continue
+        nm="$(job_attr "$t" Job_Name)"; eh="$(job_attr "$t" exec_host)"
+        running+=("$id"); labels+=("$id  ${nm:-?}  @${eh%%/*}")
+    done
+    case ${#running[@]} in
+        0) echo "sshjob: you have no running jobs" >&2; exit 1;;
+        1) jid="${running[0]}";;
+        *) echo "Select a job:" >&2
+           select l in "${labels[@]}"; do
+               [ -n "$l" ] && { jid="${running[$((REPLY-1))]}"; break; }
+           done
+           [ -n "${jid:-}" ] || exit 1;;
+    esac
+else
+    jid="$1"; shift
+fi
+
+t="$(job_ftext "$jid")"
+[ -n "$t" ] || { echo "sshjob: no such job $jid" >&2; exit 1; }
+state="$(job_attr "$t" job_state)"
+[ "$state" = "R" ] || { echo "sshjob: job $jid is not running (state ${state:-?})" >&2; exit 1; }
+
+exec_host="$(job_attr "$t" exec_host)"
+[ -n "$exec_host" ] || { echo "sshjob: job $jid has no exec_host yet" >&2; exit 1; }
+
+IFS='+' read -ra chunks <<<"$exec_host"
+nnodes=${#chunks[@]}
+if [ "$node_idx" -lt 1 ] || [ "$node_idx" -gt "$nnodes" ]; then
+    echo "sshjob: node index $node_idx out of range (job $jid has $nnodes node(s))" >&2
+    exit 1
+fi
+node="${chunks[$((node_idx-1))]%%/*}"
+
+[ "$nnodes" -gt 1 ] && echo "sshjob: job $jid spans $nnodes nodes; connecting to #$node_idx ($node)" >&2
+
+# Compute node host keys get reused across different jobs, so don't persist them (avoids the
+# "REMOTE HOST IDENTIFICATION HAS CHANGED" refusal); -t forces a tty so htop/top/vim work.
+exec ssh -t \
+    -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
+    "$node" "$@"

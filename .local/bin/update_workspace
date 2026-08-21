@@ -1,0 +1,9 @@
+#! /bin/bash
+set -euo pipefail
+
+target="${1:-.}"
+pushd "$target" > /dev/null
+trap 'popd > /dev/null' EXIT
+
+git pull origin main
+julia --project="./" -e 'update_workspace()'

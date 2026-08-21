@@ -7,6 +7,7 @@ pub enum TopTab {
     Usage,
     LogPreview,
     Details,
+    Processes,
 }
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,10 @@ pub enum Update {
     Usage(String),
     Users(Vec<String>), // fuzzy candidates for the `u` switch (project-group members)
     Array(Option<String>),
+    Recent(Option<String>),  // finished-jobs panel (None = no history)
+    Account(String),         // SU + storage header lines
+    Expiry(Option<String>),  // scratch-expiry warning line (None = nothing expiring)
+    Procs { job: String, text: String }, // qps listing for the Processes tab
     Log { lines: Vec<String>, replace: bool },
     Error { source: String, message: String },
     Details { job: String, text: String, output_path: Option<PathBuf> },
@@ -25,9 +30,12 @@ pub struct App {
     pub running: Vec<usize>,          // indices into `jobs` with a running state
     pub selected: usize,              // index into `running`
     pub selected_job_id: Option<String>,
-    pub usage: String,                // ANSI per-job usage panel (usage::render)
+    pub usage: String,                // ANSI per-job usage panel (usage::render_full)
     pub usage_at: Option<Instant>,
     pub array: Option<String>,
+    pub recent: Option<String>,       // ANSI finished-jobs panel
+    pub account: String,              // ANSI SU + storage header (empty until fetched)
+    pub expiry: Option<String>,       // ANSI scratch-expiry warning line
     pub jobs_at: Option<Instant>,
     pub log: Vec<String>,
     pub log_scroll: usize,
@@ -42,9 +50,14 @@ pub struct App {
     pub show_array: bool,
     pub show_queued: bool,
     pub show_running: bool,
+    pub show_recent: bool,
     pub details: String,
     pub details_job: Option<String>,
     pub details_scroll: usize,
+    pub procs: String,                // qps output for the Processes tab
+    pub procs_job: Option<String>,    // job the procs pane is showing/fetching
+    pub procs_follow: bool,
+    pub procs_scroll: usize,
     pub top_inner_h: usize,
     pub user: String,             // currently monitored user
     pub project: String,          // $PROJECT, shown in the status line
@@ -65,6 +78,9 @@ impl App {
             usage: String::new(),
             usage_at: None,
             array: None,
+            recent: None,
+            account: String::new(),
+            expiry: None,
             jobs_at: None,
             log: Vec::new(),
             log_scroll: 0,
@@ -79,9 +95,14 @@ impl App {
             show_array: true,
             show_queued: true,
             show_running: true,
+            show_recent: true,
             details: String::new(),
             details_job: None,
             details_scroll: 0,
+            procs: String::new(),
+            procs_job: None,
+            procs_follow: true,
+            procs_scroll: 0,
             top_inner_h: 0,
             user: String::new(),
             project: String::new(),
@@ -127,6 +148,20 @@ impl App {
             }
             Update::Users(users) => self.known_users = users,
             Update::Array(a) => self.array = a,
+            Update::Recent(r) => self.recent = r,
+            Update::Account(a) => self.account = a,
+            Update::Expiry(e) => self.expiry = e,
+            Update::Procs { job, text } => {
+                // Guard against a stale response racing a rapid selection change:
+                // only the job the pane is currently pointed at may fill it.
+                if self.procs_job.as_deref() == Some(job.as_str()) {
+                    self.procs = text
+                        .lines()
+                        .map(crate::logs::sanitize_log_line)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
+            }
             Update::Log { lines, replace } => {
                 if replace {
                     self.log = lines;
@@ -204,15 +239,17 @@ impl App {
         self.top_tab = match self.top_tab {
             TopTab::Usage => TopTab::LogPreview,
             TopTab::LogPreview => TopTab::Details,
-            TopTab::Details => TopTab::Usage,
+            TopTab::Details => TopTab::Processes,
+            TopTab::Processes => TopTab::Usage,
         };
     }
 
     pub fn prev_tab(&mut self) {
         self.top_tab = match self.top_tab {
-            TopTab::Usage => TopTab::Details,
+            TopTab::Usage => TopTab::Processes,
             TopTab::LogPreview => TopTab::Usage,
             TopTab::Details => TopTab::LogPreview,
+            TopTab::Processes => TopTab::Details,
         };
     }
 
@@ -222,6 +259,7 @@ impl App {
             TopTab::Usage => (&mut self.usage_follow, &mut self.usage_scroll),
             TopTab::LogPreview => (&mut self.log_follow, &mut self.log_scroll),
             TopTab::Details => (&mut self.details_follow, &mut self.details_scroll),
+            TopTab::Processes => (&mut self.procs_follow, &mut self.procs_scroll),
         }
     }
 
@@ -255,7 +293,15 @@ impl App {
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        *self.active().0 = true;
+        if self.top_tab == TopTab::Usage {
+            // Usage "follows" its top edge (see ui::render_top), so End is a
+            // plain jump to the bottom, clamped to the real extent at render.
+            let (follow, scroll) = self.active();
+            *follow = false;
+            *scroll = usize::MAX;
+        } else {
+            *self.active().0 = true;
+        }
     }
 
     /// Open the username input box with a clean (empty) buffer.
@@ -323,6 +369,10 @@ impl App {
 
     pub fn toggle_running(&mut self) {
         self.show_running = !self.show_running;
+    }
+
+    pub fn toggle_recent(&mut self) {
+        self.show_recent = !self.show_recent;
     }
 }
 
@@ -449,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn tabs_cycle_three_ways() {
+    fn tabs_cycle_four_ways() {
         let mut app = App::new();
         assert_eq!(app.top_tab, TopTab::Usage);
         app.next_tab();
@@ -457,11 +507,42 @@ mod tests {
         app.next_tab();
         assert_eq!(app.top_tab, TopTab::Details);
         app.next_tab();
+        assert_eq!(app.top_tab, TopTab::Processes);
+        app.next_tab();
         assert_eq!(app.top_tab, TopTab::Usage);
         app.prev_tab();
-        assert_eq!(app.top_tab, TopTab::Details);
+        assert_eq!(app.top_tab, TopTab::Processes);
         app.prev_tab();
-        assert_eq!(app.top_tab, TopTab::LogPreview);
+        assert_eq!(app.top_tab, TopTab::Details);
+    }
+
+    #[test]
+    fn recent_account_expiry_updates() {
+        let mut app = App::new();
+        assert!(app.show_recent);
+        app.apply(Update::Recent(Some("montest  ok".into())));
+        assert_eq!(app.recent.as_deref(), Some("montest  ok"));
+        app.apply(Update::Recent(None));
+        assert_eq!(app.recent, None);
+        app.apply(Update::Account("SU (2026.q3): …".into()));
+        assert!(app.account.starts_with("SU"));
+        app.apply(Update::Expiry(Some("⚠ 3 paths".into())));
+        assert!(app.expiry.is_some());
+        app.toggle_recent();
+        assert!(!app.show_recent);
+    }
+
+    #[test]
+    fn procs_update_guarded_by_selected_fetch() {
+        let mut app = App::new();
+        app.procs_job = Some("2.gadi-pbs".into());
+        // A stale response for job 1 must not overwrite job 2's pane…
+        app.apply(Update::Procs { job: "1.gadi-pbs".into(), text: "stale".into() });
+        assert_eq!(app.procs, "");
+        // …but the matching job fills it, control chars sanitized.
+        app.apply(Update::Procs { job: "2.gadi-pbs".into(), text: "PID\tCMD\nx".into() });
+        assert!(app.procs.contains("PID"));
+        assert!(!app.procs.contains('\t'));
     }
 
     #[test]
@@ -571,6 +652,22 @@ mod tests {
         }
         assert_eq!(app.confirm_input().as_deref(), Some("zz9999"));
         assert_eq!(app.user, "zz9999");
+    }
+
+    #[test]
+    fn usage_end_jumps_without_bottom_follow() {
+        // On the Usage tab End must jump down without engaging follow — follow
+        // means "pin to top" there (ui::render_top), so engaging it would
+        // bounce the view straight back up.
+        let mut app = App::new();
+        assert_eq!(app.top_tab, TopTab::Usage);
+        app.scroll_to_bottom();
+        assert!(!app.usage_follow);
+        assert_eq!(app.usage_scroll, usize::MAX); // clamped at render time
+        // Streaming tabs keep the pin-to-bottom semantics.
+        app.next_tab();
+        app.scroll_to_bottom();
+        assert!(app.log_follow);
     }
 
     #[test]

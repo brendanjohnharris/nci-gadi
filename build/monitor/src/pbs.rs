@@ -197,25 +197,146 @@ pub fn fetch_user_jobs(user: &str) -> Result<Vec<Job>> {
 
 /// At most this many running jobs are detailed per usage poll, to keep the
 /// `qstat -f` output (a few KB per job) bounded for huge array sweeps.
-pub const USAGE_CAP: usize = 32;
+pub const RUN_CAP: usize = 24;
+/// … and this many waiting jobs (for the QUEUED est-start/comment block).
+pub const WAIT_CAP: usize = 8;
+/// At most this many nodes queried per `pbsnodes` call for the NODES block.
+pub const NODE_CAP: usize = 12;
+/// Finished jobs shown in the RECENT panel.
+pub const RECENT_CAP: usize = 8;
+
+/// Query id for a waiting job: array subjobs collapse to their `[]` master
+/// (which carries the est-start/comment for the whole array), so a queued
+/// 1000-subjob array costs one record instead of a thousand.
+fn waiting_query_id(id: &str) -> String {
+    match (id.find('['), id.find(']')) {
+        (Some(lb), Some(rb)) if rb > lb + 1 => format!("{}[]{}", &id[..lb], &id[rb + 1..]),
+        _ => id.to_string(),
+    }
+}
 
 /// Per-job usage panel (the Gadi replacement for the cluster-wide qlload):
-/// one `qstat -f <ids…>` over the running jobs, rendered by `usage::render`.
-/// With nothing running this makes no PBS call and renders the summary alone.
+/// one `qstat -f` over the running jobs (plus waiting masters, for the QUEUED
+/// diagnosis block), one `pbsnodes` over the nodes those jobs occupy, and one
+/// `qstat -Q` for queue pressure — all rendered by `usage::render_full`.
+/// With no jobs at all this makes no PBS call and renders the summary alone.
 pub fn fetch_usage(jobs: &[Job]) -> Result<String> {
     let running: Vec<&str> = jobs
         .iter()
         .filter(|j| j.state.is_running())
         .map(|j| j.id.as_str())
         .collect();
-    if running.is_empty() {
-        return Ok(crate::usage::render(jobs, "", 0));
+    let mut waiting: Vec<String> = Vec::new();
+    for j in jobs.iter().filter(|j| j.state.is_waiting()) {
+        let id = waiting_query_id(&j.id);
+        if !waiting.contains(&id) {
+            waiting.push(id);
+        }
     }
-    let truncated = running.len().saturating_sub(USAGE_CAP);
-    let mut args = vec!["-f"];
-    args.extend(running.iter().take(USAGE_CAP));
+    let truncated = running.len().saturating_sub(RUN_CAP);
+    let mut ids: Vec<String> = running.iter().take(RUN_CAP).map(|s| s.to_string()).collect();
+    ids.extend(waiting.into_iter().take(WAIT_CAP));
+    if ids.is_empty() {
+        return Ok(crate::usage::render_full(jobs, "", 0, None, None));
+    }
+    let mut args: Vec<&str> = vec!["-f"];
+    args.extend(ids.iter().map(|s| s.as_str()));
     let detail = run_lenient("qstat", &args)?;
-    Ok(crate::usage::render(jobs, &detail, truncated))
+
+    // The nodes my running jobs occupy, from the freshly fetched detail. The
+    // side queries degrade silently: a pbsnodes/qstat -Q hiccup should never
+    // take the whole panel down.
+    let mut hosts: Vec<String> = Vec::new();
+    for rec in crate::usage::parse_usage(&detail) {
+        if rec.is_running() {
+            for h in rec.hosts {
+                if !hosts.contains(&h) {
+                    hosts.push(h);
+                }
+            }
+        }
+    }
+    hosts.truncate(NODE_CAP);
+    let nodes_raw = if hosts.is_empty() {
+        None
+    } else {
+        let node_args: Vec<&str> = hosts.iter().map(|s| s.as_str()).collect();
+        run("pbsnodes", &node_args).ok()
+    };
+    let queues_raw = run("qstat", &["-Q"]).ok();
+
+    Ok(crate::usage::render_full(
+        jobs,
+        &detail,
+        truncated,
+        nodes_raw.as_deref(),
+        queues_raw.as_deref(),
+    ))
+}
+
+/// The RECENT panel: finished jobs from Gadi's job history. `qstat -fx -u` is
+/// not supported on Gadi, so this is a bounded two-step: the `-xw` history
+/// table for F-state ids (newest last), then one `qstat -fx` over the last
+/// `RECENT_CAP` of them for Exit_status/obittime.
+pub fn fetch_recent(user: &str) -> Result<Option<String>> {
+    let table = run("qstat", &["-xw", "-u", user])?;
+    let finished: Vec<String> = parse_qstat(&table)
+        .into_iter()
+        .filter(|j| j.state == JobState::Other('F'))
+        .map(|j| j.id)
+        .collect();
+    if finished.is_empty() {
+        return Ok(None);
+    }
+    let start = finished.len().saturating_sub(RECENT_CAP);
+    let mut args = vec!["-fx"];
+    args.extend(finished[start..].iter().map(|s| s.as_str()));
+    let detail = run_lenient("qstat", &args)?;
+    Ok(crate::usage::render_recent(&detail))
+}
+
+/// SU + storage quota chart from `nci_account -P <project>` plus the
+/// home-directory quota from `quota`. nci_account is slow (a few seconds), so
+/// this is polled on its own long cadence. Either source may fail alone (the
+/// chart just loses those rows); only a total failure surfaces an error.
+pub fn fetch_account(project: &str) -> Result<Option<String>> {
+    // `quota` exits nonzero when a quota is exceeded — exactly when the output
+    // matters most — hence the lenient runner.
+    let home = run_lenient("quota", &[]).ok();
+    let nci = if project.is_empty() {
+        Ok(String::new())
+    } else {
+        run("nci_account", &["-P", project])
+    };
+    let nci_raw = match nci {
+        Ok(s) => s,
+        Err(e) => {
+            if home.is_none() {
+                return Err(e);
+            }
+            String::new()
+        }
+    };
+    Ok(crate::usage::render_account(&nci_raw, home.as_deref()))
+}
+
+/// Scratch-expiry warning from `nci-file-expiry list-warnings` (None when
+/// nothing is scheduled to expire).
+pub fn fetch_expiry() -> Result<Option<String>> {
+    let raw = run("nci-file-expiry", &["list-warnings"])?;
+    Ok(crate::usage::render_expiry(&raw))
+}
+
+/// Process listing of a running job via Gadi's `qps` (a `ps` run on the job's
+/// compute nodes). For GPU jobs, try `qps_gpu` first — same listing plus GPU
+/// utilisation — falling back to plain `qps` if it's absent or unhappy.
+pub fn fetch_procs(jobid: &str, gpu: bool) -> Result<String> {
+    if gpu {
+        if let Ok(out) = run("qps_gpu", &[jobid]) {
+            return Ok(out);
+        }
+    }
+    run("qps", &[jobid])
 }
 
 /// Array-job progress, rendered by the in-process qarray port (see `qarray.rs`).
@@ -334,6 +455,23 @@ mod tests {
             Some(std::path::PathBuf::from("/scratch/xr78/bh5941/runs/VASP.out"))
         );
         assert_eq!(output_path("no attribute here"), None);
+    }
+
+    #[test]
+    fn waiting_ids_collapse_to_array_master() {
+        assert_eq!(waiting_query_id("174190001[3].gadi-pbs"), "174190001[].gadi-pbs");
+        assert_eq!(waiting_query_id("174190001[].gadi-pbs"), "174190001[].gadi-pbs");
+        assert_eq!(waiting_query_id("174187629.gadi-pbs"), "174187629.gadi-pbs");
+    }
+
+    #[test]
+    fn history_rows_parse_as_finished() {
+        // qstat -xw history rows carry state F and HH:MM:SS elapsed times.
+        let jobs = parse_qstat(
+            "174190352.gadi-pbs   bh5941   copyq-exec   montest   501688   1   1   1024m 00:08 F 00:01:32\n",
+        );
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, JobState::Other('F'));
     }
 
     #[test]
